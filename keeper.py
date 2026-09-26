@@ -27,6 +27,12 @@ v4 变更(相对 v3):
   (典型场景: OpenAI 按出口 IP 段封锁, 快节点整体沦陷), 自动扩大
   范围实测剩余全部日/美节点, 慢节点往往在不同 IP 段仍可用
 
+v4.2 变更:
+- 新增: 备用线路自动故障转移 —— Vortex 全部节点不可用时, 系统代理
+  自动切到 Clash Party 备用线路(7890, Mynet); 主线路恢复健康后
+  自动切回(7897)。系统代理由此程序统一管理, 请勿在 Vortex/
+  Clash Party 里再手动操作系统代理开关, 避免互相打架。
+
 容错设计:
 - flock 进程锁, 高频运行不撞车(launchd 每分钟调度也安全)
 - 单节点测试失败不影响其他节点(逐节点 try/except)
@@ -42,6 +48,7 @@ v4 变更(相对 v3):
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -51,7 +58,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 BASE = "http://127.0.0.1:39797"    # Vortex 控制 API
-PROXY = "http://127.0.0.1:7897"   # 本地混合代理端口
+PROXY = "http://127.0.0.1:7897"   # 本地混合代理端口(Vortex 主线路)
+BACKUP_PROXY = "http://127.0.0.1:7890"  # Clash Party 备用线路(Mynet)
+MAIN_PORT = 7897
+BACKUP_PORT = 7890
 GROUP = "节点选择"
 KEYWORDS = ("日本", "美国")        # ChatGPT 支持区, 绝不用香港
 TOP_N = 6                          # 深度测试的节点数量
@@ -136,6 +146,120 @@ def get_current():
         return None
 
 
+# ------------------------------------------------- 系统代理与备用线路
+def proxy_services():
+    """返回当前启用了网页代理的网络服务名列表"""
+    try:
+        out = subprocess.run(["networksetup", "-listallnetworkservices"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return []
+    svcs = [l.strip() for l in out.splitlines()[1:]
+            if l.strip() and not l.startswith("An asterisk")]
+    enabled = []
+    for s in svcs:
+        try:
+            info = subprocess.run(["networksetup", "-getwebproxy", s],
+                                  capture_output=True, text=True, timeout=10).stdout
+            if "Enabled: Yes" in info:
+                enabled.append(s)
+        except Exception:
+            continue
+    return enabled
+
+
+def active_services():
+    """返回当前有 IPv4 地址(联网中)的网络服务名列表"""
+    try:
+        out = subprocess.run(["networksetup", "-listallnetworkservices"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return []
+    svcs = [l.strip() for l in out.splitlines()[1:]
+            if l.strip() and not l.startswith("An asterisk")]
+    active = []
+    for s in svcs:
+        try:
+            info = subprocess.run(["networksetup", "-getinfo", s],
+                                  capture_output=True, text=True, timeout=10).stdout
+            for line in info.splitlines():
+                line = line.strip()
+                if line.startswith("IP address:") and line != "IP address: none":
+                    active.append(s)
+                    break
+        except Exception:
+            continue
+    return active
+
+
+def set_system_proxy(port):
+    """把系统 HTTP/HTTPS 代理指向 127.0.0.1:port。
+    已有服务开代理则直接改; 全关时在联网服务上启用(带标准绕过列表)。"""
+    svcs = proxy_services()
+    fresh = not svcs
+    if fresh:
+        svcs = active_services()
+    if not svcs:
+        log("  ! 找不到可用网络服务, 无法切换系统代理到 %d" % port)
+        return False
+    ok = 0
+    for s in svcs:
+        for opt in ("-setwebproxy", "-setsecurewebproxy"):
+            try:
+                r = subprocess.run(["networksetup", opt, s, "127.0.0.1", str(port)],
+                                   capture_output=True, text=True, timeout=10)
+                if r.returncode == 0:
+                    ok += 1
+            except Exception:
+                pass
+        if fresh:
+            try:
+                subprocess.run(["networksetup", "-setproxybypassdomains", s,
+                                "127.0.0.1", "192.168.0.0/16", "10.0.0.0/8",
+                                "172.16.0.0/12", "localhost", "*.local", "<local>"],
+                               capture_output=True, timeout=10)
+            except Exception:
+                pass
+    if ok < len(svcs) * 2:
+        log("  ! 系统代理切换到 %d 仅 %d/%d 项成功" % (port, ok, len(svcs) * 2))
+    return ok >= len(svcs) * 2
+
+
+def current_proxy_port():
+    """读取系统 HTTP 代理端口; 代理全关返回 None"""
+    try:
+        out = subprocess.run(["scutil", "--proxy"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None
+    if not re.search(r"HTTPEnable\s*:\s*1", out):
+        return None
+    m = re.search(r"HTTPPort\s*:\s*(\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def backup_ok():
+    """备用线路(Clash Party/Mynet)能否访问 ChatGPT"""
+    out = curl(["-x", BACKUP_PROXY, "--max-time", "8", "-w",
+                "\nMETRICS:%{http_code}", "https://chatgpt.com/cdn-cgi/trace"], timeout=12)
+    return "METRICS:200" in out
+
+
+def restore_main_if_failover(context):
+    """处于备用线路状态且主线路已可用时, 把系统代理切回 Vortex(7897)"""
+    st = load_state()
+    if not st.get("failover"):
+        return
+    if set_system_proxy(MAIN_PORT):
+        st["failover"] = False
+        save_state(st)
+        notify("recover", "节点守护: 主线路已恢复",
+               "已切回 Vortex 主线路(7897), %s" % context)
+        log(">>> 主线路恢复(%s), 系统代理切回 %d" % (context, MAIN_PORT))
+    else:
+        log("  ! 系统代理切回 %d 失败, 继续使用备用线路" % MAIN_PORT)
+
+
 def delay_test(name):
     """通过 API 直测单节点延迟, 不需要切换分组"""
     q = urllib.parse.quote(name, safe="")
@@ -184,6 +308,7 @@ def write_status(current, healthy, detail, state):
         "current": current,
         "healthy": healthy,   # True/False/None(守护链路异常)
         "detail": detail,
+        "failover": bool(state.get("failover")),
         "last_deep": last_deep_h,
         "history": state.get("history", []),
         "last_report": state.get("last_report", {}),
@@ -337,8 +462,19 @@ def deep_test(reason):
         log("全部 %d 个日/美节点都无法访问 ChatGPT(疑似出口 IP 段被 OpenAI 封锁), 保持 %s"
             % (len(report), current))
         switch(current)
-        notify("alldown", "节点守护: 候选节点全部不可用",
-               "深度测试: 所有候选都无法访问 ChatGPT, 保持当前节点")
+        # 主线路全挂: 自动故障转移到 Clash Party 备用线路
+        if backup_ok():
+            if set_system_proxy(BACKUP_PORT):
+                st = load_state()
+                if not st.get("failover"):
+                    st["failover"] = True
+                    save_state(st)
+                    notify("failover", "节点守护: 已切换备用线路",
+                           "Vortex 全部节点不可用, 系统代理已切到 Mynet 备用线(7890)")
+                log(">>> 主线路全挂, 系统代理已切到备用线路 Mynet(%d)" % BACKUP_PORT)
+        else:
+            notify("alldown", "节点守护: 主/备线路均不可用",
+                   "Vortex 全部节点与 Mynet 备用线都无法访问 ChatGPT")
         return
 
     def rank_key(n):
@@ -355,6 +491,7 @@ def deep_test(reason):
     if best == current:
         log("当前节点 %s 已是候选中最优(%.1f MB/s), 不切换" % (current, best_speed))
         switch(current)
+        restore_main_if_failover("节点 %s 可用" % best)
         return
 
     if cur_valid:
@@ -363,6 +500,7 @@ def deep_test(reason):
             log("当前节点 %s 仍可用(%.1f MB/s), 最快候选 %s(%.1f MB/s)优势不足 %.0f%%, 不切换"
                 % (current, cur_speed, best, best_speed, (HYSTERESIS - 1) * 100))
             switch(current)
+            restore_main_if_failover("节点 %s 可用(%.1f MB/s)" % (current, cur_speed))
             return
     elif cur_loc and cur_speed > 0:
         # 当前节点可用但实测带宽低于可用阈值(慢节点, 非测速失败):
@@ -371,6 +509,7 @@ def deep_test(reason):
             log("当前节点 %s 带宽仅 %.1f MB/s, 但候选均无有效带宽数据, 保守保持"
                 % (current, cur_speed))
             switch(current)
+            restore_main_if_failover("节点 %s 可用" % current)
             return
         log("当前节点 %s 带宽仅 %.1f MB/s(低于 %.1f 阈值), 切换到更快的 %s"
             % (current, cur_speed, SPEED_FLOOR, best))
@@ -378,6 +517,7 @@ def deep_test(reason):
         # 当前节点可用但测速双通道全失败(0.0): 无效数据不做切换决策
         log("当前节点 %s 可用但带宽数据无效(测速通道不可用), 保守保持不切换" % current)
         switch(current)
+        restore_main_if_failover("节点 %s 可用" % current)
         return
     else:
         # 当前节点无法访问 ChatGPT: 降级选优(优先有效数据, 其次延迟最低)
@@ -397,6 +537,7 @@ def deep_test(reason):
             % (region, report[best][0]))
     notify("switch", "节点守护: 已切换节点",
            "%s → %s(%.1f MB/s, 出口 %s)" % (current, best, best_speed, report[best][0]))
+    restore_main_if_failover("已切换到 %s(%.1f MB/s)" % (best, best_speed))
 
     st = load_state()
     hist = st.setdefault("history", [])
@@ -424,7 +565,27 @@ def main():
         state = load_state()
         current, healthy, detail = light_check()
 
-        if force_deep:
+        # 系统代理自愈: 代理开着但指向不对时纠偏(防睡眠唤醒/网络切换后
+        # 被其他代理应用抢占或残留)。用户主动全关代理则尊重不强开;
+        # 主线路不健康时不纠偏, 交给深度测试决策(可能要切备用线)。
+        failover = bool(state.get("failover"))
+        port = current_proxy_port()
+        if port is not None:
+            expected = BACKUP_PORT if failover else (MAIN_PORT if healthy else None)
+            if expected and port != expected and set_system_proxy(expected):
+                log("系统代理 %d -> %d(自愈纠偏)" % (port, expected))
+
+        if failover:
+            # 备用线路期间: 主线路恢复健康立即切回;
+            # 未恢复则按 DEEP_INTERVAL 节奏巡检主线路, 不每分钟折腾
+            if healthy:
+                restore_main_if_failover("当前节点 %s(%s)" % (current, detail))
+                return
+            if force_deep or time.time() - state.get("last_deep", 0) >= DEEP_INTERVAL:
+                did_deep = True
+                deep_test("备用期间主线路巡检: %s" % detail)
+            # 其余情况: 保持备用线路, 静默等待下轮体检
+        elif force_deep:
             did_deep = True
             deep_test("手动强制")
         elif healthy:

@@ -131,9 +131,10 @@ function ago(ts) {
   return Math.round(s/3600) + " 小时前更新";
 }
 
-function badgeOf(h) {
-  if (h === true)  return '<span class="badge ok">健康</span>';
-  if (h === false) return '<span class="badge bad">异常</span>';
+function badgeOf(d) {
+  if (d.failover)         return '<span class="badge warn">备用线路中</span>';
+  if (d.healthy === true)  return '<span class="badge ok">健康</span>';
+  if (d.healthy === false) return '<span class="badge bad">异常</span>';
   return '<span class="badge warn">守护未连通</span>';
 }
 
@@ -156,13 +157,15 @@ async function refresh() {
     const d = await r.json();
     if (d.error) {
       $("fresh").textContent = "等待 keeper 首次运行…";
-      $("node").textContent = "—"; $("badge").innerHTML = badgeOf(null);
+      $("node").textContent = "—"; $("badge").innerHTML = badgeOf({});
       $("detail").textContent = d.error; return;
     }
     $("fresh").textContent = ago(d.updated_ts);
     $("node").textContent = d.current || "(未知)";
-    $("badge").innerHTML = badgeOf(d.healthy);
+    $("badge").innerHTML = badgeOf(d);
     $("detail").innerHTML = "体检详情: <b>" + esc(d.detail) + "</b>";
+    if (d.failover)
+      $("detail").innerHTML += "<br>系统流量当前走 <b>Mynet 备用线(7890)</b>, 主线路恢复后自动切回";
     $("deep").textContent = d.last_deep || "从未";
 
     const rep = Object.entries(d.last_report || {})
