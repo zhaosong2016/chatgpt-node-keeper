@@ -1,0 +1,8 @@
+.keeper.lock
+.keeper.state
+keeper.log
+status.json
+launchd*.log
+*.tmp
+__pycache__/
+.DS_Store
