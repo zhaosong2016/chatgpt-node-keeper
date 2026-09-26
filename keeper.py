@@ -33,6 +33,14 @@ v4.2 变更:
   自动切回(7897)。系统代理由此程序统一管理, 请勿在 Vortex/
   Clash Party 里再手动操作系统代理开关, 避免互相打架。
 
+v4.3 变更(线路角色反转):
+- 主力线路 = Mynet 自建(Clash Party, 7890): 独享 CN2 GIA, 实测
+  成功率与延迟稳定性均优于订阅线。每分钟直测 ChatGPT 健康度。
+- 备用线路 = SakuraCat 订阅(Vortex, 7897): Mynet 异常时接管,
+  先体检当前节点, 不行再深度测试 16 节点选优; Mynet 恢复自动切回。
+- 深度测试仅服务于备用线路的节点选优, 主力正常时不产生节点流量。
+- 注意: Mynet 为 20G/月 限流量套餐, 重度下载场景请留意用量。
+
 容错设计:
 - flock 进程锁, 高频运行不撞车(launchd 每分钟调度也安全)
 - 单节点测试失败不影响其他节点(逐节点 try/except)
@@ -57,11 +65,11 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-BASE = "http://127.0.0.1:39797"    # Vortex 控制 API
-PROXY = "http://127.0.0.1:7897"   # 本地混合代理端口(Vortex 主线路)
-BACKUP_PROXY = "http://127.0.0.1:7890"  # Clash Party 备用线路(Mynet)
-MAIN_PORT = 7897
-BACKUP_PORT = 7890
+BASE = "http://127.0.0.1:39797"    # SakuraCat/Vortex 控制 API
+PROXY = "http://127.0.0.1:7897"   # SakuraCat 订阅线(备用, 节点深度测试用)
+MYNET_PROXY = "http://127.0.0.1:7890"  # Mynet 自建线(主力, Clash Party)
+MAIN_PORT = 7890    # 主力线路 = Mynet 自建(Clash Party, 稳定独享)
+BACKUP_PORT = 7897  # 备用线路 = SakuraCat 订阅(Vortex, 16 节点)
 GROUP = "节点选择"
 KEYWORDS = ("日本", "美国")        # ChatGPT 支持区, 绝不用香港
 TOP_N = 6                          # 深度测试的节点数量
@@ -238,26 +246,52 @@ def current_proxy_port():
     return int(m.group(1)) if m else None
 
 
-def backup_ok():
-    """备用线路(Clash Party/Mynet)能否访问 ChatGPT"""
-    out = curl(["-x", BACKUP_PROXY, "--max-time", "8", "-w",
-                "\nMETRICS:%{http_code}", "https://chatgpt.com/cdn-cgi/trace"], timeout=12)
-    return "METRICS:200" in out
+def line_check(url, name):
+    """体检指定线路对 ChatGPT 的健康度, 返回 (健康, 详情)"""
+    out = curl(["-x", url, "--max-time", "8", "-w",
+                "\nMETRICS:%{http_code}:%{time_total}",
+                "https://chatgpt.com/cdn-cgi/trace"], timeout=12)
+    if "METRICS:" not in out:
+        return False, "%s: ChatGPT 无响应" % name
+    code, _, t = out.rsplit("METRICS:", 1)[1].strip().partition(":")
+    try:
+        elapsed = float(t)
+    except ValueError:
+        elapsed = 99.0
+    if code != "200":
+        return False, "%s: ChatGPT 返回 HTTP %s" % (name, code)
+    if elapsed > TRACE_TIMEOUT:
+        return False, "%s: 响应过慢(%.1fs)" % (name, elapsed)
+    return True, "%s ok %.1fs" % (name, elapsed)
 
 
-def restore_main_if_failover(context):
-    """处于备用线路状态且主线路已可用时, 把系统代理切回 Vortex(7897)"""
+def enable_backup(context):
+    """切到 SakuraCat 备用线(7897)并标记 failover"""
+    if not set_system_proxy(BACKUP_PORT):
+        return False
     st = load_state()
     if not st.get("failover"):
-        return
-    if set_system_proxy(MAIN_PORT):
+        st["failover"] = True
+        save_state(st)
+        notify("failover", "节点守护: 已切换备用线路",
+               "Mynet 异常(%s), 系统代理已切到 SakuraCat 备用线(7897)" % context)
+    log(">>> 切换备用线路: 系统代理 -> %d(%s)" % (BACKUP_PORT, context))
+    return True
+
+
+def restore_main(context):
+    """切回 Mynet 主力线(7890)并清除 failover 标记"""
+    if not set_system_proxy(MAIN_PORT):
+        log("  ! 系统代理切回 %d 失败, 继续使用备用线路" % MAIN_PORT)
+        return False
+    st = load_state()
+    if st.get("failover"):
         st["failover"] = False
         save_state(st)
-        notify("recover", "节点守护: 主线路已恢复",
-               "已切回 Vortex 主线路(7897), %s" % context)
-        log(">>> 主线路恢复(%s), 系统代理切回 %d" % (context, MAIN_PORT))
-    else:
-        log("  ! 系统代理切回 %d 失败, 继续使用备用线路" % MAIN_PORT)
+        notify("recover", "节点守护: 主力线路已恢复",
+               "Mynet 恢复(%s), 已切回 7890" % context)
+    log(">>> 主力恢复(%s), 系统代理 -> %d" % (context, MAIN_PORT))
+    return True
 
 
 def delay_test(name):
@@ -462,19 +496,8 @@ def deep_test(reason):
         log("全部 %d 个日/美节点都无法访问 ChatGPT(疑似出口 IP 段被 OpenAI 封锁), 保持 %s"
             % (len(report), current))
         switch(current)
-        # 主线路全挂: 自动故障转移到 Clash Party 备用线路
-        if backup_ok():
-            if set_system_proxy(BACKUP_PORT):
-                st = load_state()
-                if not st.get("failover"):
-                    st["failover"] = True
-                    save_state(st)
-                    notify("failover", "节点守护: 已切换备用线路",
-                           "Vortex 全部节点不可用, 系统代理已切到 Mynet 备用线(7890)")
-                log(">>> 主线路全挂, 系统代理已切到备用线路 Mynet(%d)" % BACKUP_PORT)
-        else:
-            notify("alldown", "节点守护: 主/备线路均不可用",
-                   "Vortex 全部节点与 Mynet 备用线都无法访问 ChatGPT")
+        notify("alldown", "节点守护: 备用线路节点全部不可用",
+               "SakuraCat 全部节点无法访问 ChatGPT; 若 Mynet 也异常则两线全挂")
         return
 
     def rank_key(n):
@@ -491,7 +514,6 @@ def deep_test(reason):
     if best == current:
         log("当前节点 %s 已是候选中最优(%.1f MB/s), 不切换" % (current, best_speed))
         switch(current)
-        restore_main_if_failover("节点 %s 可用" % best)
         return
 
     if cur_valid:
@@ -500,7 +522,6 @@ def deep_test(reason):
             log("当前节点 %s 仍可用(%.1f MB/s), 最快候选 %s(%.1f MB/s)优势不足 %.0f%%, 不切换"
                 % (current, cur_speed, best, best_speed, (HYSTERESIS - 1) * 100))
             switch(current)
-            restore_main_if_failover("节点 %s 可用(%.1f MB/s)" % (current, cur_speed))
             return
     elif cur_loc and cur_speed > 0:
         # 当前节点可用但实测带宽低于可用阈值(慢节点, 非测速失败):
@@ -509,7 +530,6 @@ def deep_test(reason):
             log("当前节点 %s 带宽仅 %.1f MB/s, 但候选均无有效带宽数据, 保守保持"
                 % (current, cur_speed))
             switch(current)
-            restore_main_if_failover("节点 %s 可用" % current)
             return
         log("当前节点 %s 带宽仅 %.1f MB/s(低于 %.1f 阈值), 切换到更快的 %s"
             % (current, cur_speed, SPEED_FLOOR, best))
@@ -517,7 +537,6 @@ def deep_test(reason):
         # 当前节点可用但测速双通道全失败(0.0): 无效数据不做切换决策
         log("当前节点 %s 可用但带宽数据无效(测速通道不可用), 保守保持不切换" % current)
         switch(current)
-        restore_main_if_failover("节点 %s 可用" % current)
         return
     else:
         # 当前节点无法访问 ChatGPT: 降级选优(优先有效数据, 其次延迟最低)
@@ -537,7 +556,6 @@ def deep_test(reason):
             % (region, report[best][0]))
     notify("switch", "节点守护: 已切换节点",
            "%s → %s(%.1f MB/s, 出口 %s)" % (current, best, best_speed, report[best][0]))
-    restore_main_if_failover("已切换到 %s(%.1f MB/s)" % (best, best_speed))
 
     st = load_state()
     hist = st.setdefault("history", [])
@@ -560,50 +578,81 @@ def main():
         return
 
     did_deep = False
-    current, healthy, detail = None, None, "未运行"
+    current, healthy, detail = "Mynet-YF", None, "未运行"
     try:
         state = load_state()
-        current, healthy, detail = light_check()
+        failover = bool(state.get("failover"))
+
+        # 主力线路体检: Mynet 自建线(7890), 单节点直测
+        my_ok, my_detail = line_check(MYNET_PROXY, "Mynet")
 
         # 系统代理自愈: 代理开着但指向不对时纠偏(防睡眠唤醒/网络切换后
         # 被其他代理应用抢占或残留)。用户主动全关代理则尊重不强开;
-        # 主线路不健康时不纠偏, 交给深度测试决策(可能要切备用线)。
-        failover = bool(state.get("failover"))
+        # 目标不明确时(主力挂了待决策)不纠偏, 交给下方决策流程。
+        target = (MAIN_PORT if my_ok else None) if not failover else BACKUP_PORT
+        if failover and my_ok:
+            target = MAIN_PORT  # 即将切回主力
         port = current_proxy_port()
-        if port is not None:
-            expected = BACKUP_PORT if failover else (MAIN_PORT if healthy else None)
-            if expected and port != expected and set_system_proxy(expected):
-                log("系统代理 %d -> %d(自愈纠偏)" % (port, expected))
+        if target and port is not None and port != target:
+            if set_system_proxy(target):
+                log("系统代理 %d -> %d(自愈纠偏)" % (port, target))
 
         if failover:
-            # 备用线路期间: 主线路恢复健康立即切回;
-            # 未恢复则按 DEEP_INTERVAL 节奏巡检主线路, 不每分钟折腾
-            if healthy:
-                restore_main_if_failover("当前节点 %s(%s)" % (current, detail))
+            # 备用(SakuraCat)模式: Mynet 恢复立即切回主力
+            if my_ok:
+                restore_main(my_detail)
+                current, healthy, detail = "Mynet-YF", True, my_detail
                 return
+            # Mynet 仍异常: 维持备用, 按节奏巡检 Vortex 节点质量
+            current, healthy, detail = light_check()
+            detail = "%s(走 SakuraCat 备用)" % my_detail
             if force_deep or time.time() - state.get("last_deep", 0) >= DEEP_INTERVAL:
                 did_deep = True
-                deep_test("备用期间主线路巡检: %s" % detail)
-            # 其余情况: 保持备用线路, 静默等待下轮体检
-        elif force_deep:
-            did_deep = True
-            deep_test("手动强制")
-        elif healthy:
-            if time.time() - state.get("last_deep", 0) < DEEP_INTERVAL:
-                return  # 一切正常, 静默退出(不写日志)
-            did_deep = True
-            deep_test("例行巡检(距上次已超 %d 分钟)" % (DEEP_INTERVAL // 60))
+                deep_test("备用模式例行巡检(%s)" % my_detail)
+        elif my_ok:
+            # 主力健康: 静默。手动 --deep 仍可触发节点深度测试
+            current, healthy, detail = "Mynet-YF", True, my_detail
+            if force_deep:
+                did_deep = True
+                deep_test("手动强制")
         else:
+            # 主力异常: 评估备用(SakuraCat)能否接管
             did_deep = True
-            deep_test("体检异常: %s" % detail)
+            current, healthy, detail = light_check()
+            if healthy:
+                # Vortex 当前节点可用, 直接接管
+                enable_backup(my_detail)
+                detail = "%s(已切 SakuraCat 备用)" % my_detail
+            elif healthy is False:
+                # Vortex 节点也异常: 深度测试选优后接管
+                deep_test("主力异常(%s) + Vortex 体检异常: %s"
+                          % (my_detail, detail))
+                _, v_ok2, _ = light_check()
+                if v_ok2:
+                    enable_backup(my_detail)
+                    detail = "%s(已切 SakuraCat 备用)" % my_detail
+                else:
+                    current, healthy, detail = "Mynet-YF", False, my_detail
+                    notify("alldown", "节点守护: 主/备线路均不可用",
+                           "Mynet(%s)与 SakuraCat 节点都无法访问 ChatGPT" % my_detail)
+            else:
+                # Vortex API 不可达: 直测 7897 通道本身
+                v_ok2, v_detail = line_check(PROXY, "Vortex")
+                if v_ok2:
+                    enable_backup(my_detail)
+                    detail = "%s(已切 SakuraCat 备用)" % my_detail
+                else:
+                    current, healthy, detail = "Mynet-YF", False, my_detail
+                    notify("api", "节点守护: SakuraCat API 与通道均不可达",
+                           "主力异常且 Vortex API 不可达(%s)" % my_detail)
     except Exception as e:
         log("主流程异常(已兜住): %s" % e)
     finally:
         state = load_state()
         if did_deep:
             state["last_deep"] = time.time()
-            state["last_node"] = current or None
-            # 深度测试可能已切换节点, 重新读取实际指向, 保证 status.json 准确
+        if state.get("failover"):
+            # 备用模式下 status 显示 Vortex 实际节点
             fresh = get_current()
             if fresh:
                 current = fresh

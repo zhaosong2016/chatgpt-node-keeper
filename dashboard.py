@@ -137,6 +137,7 @@ function badgeOf(d) {
   if (d.healthy === false) return '<span class="badge bad">异常</span>';
   return '<span class="badge warn">守护未连通</span>';
 }
+// 主力 = Mynet 自建(7890), 备用 = SakuraCat 订阅(7897)
 
 function locTag(loc) {
   if (!loc) return '<span class="tag no">不通</span>';
@@ -165,7 +166,7 @@ async function refresh() {
     $("badge").innerHTML = badgeOf(d);
     $("detail").innerHTML = "体检详情: <b>" + esc(d.detail) + "</b>";
     if (d.failover)
-      $("detail").innerHTML += "<br>系统流量当前走 <b>Mynet 备用线(7890)</b>, 主线路恢复后自动切回";
+      $("detail").innerHTML += "<br>主力 Mynet(7890) 异常, 流量走 <b>SakuraCat 备用线(7897)</b>, 恢复后自动切回";
     $("deep").textContent = d.last_deep || "从未";
 
     const rep = Object.entries(d.last_report || {})
