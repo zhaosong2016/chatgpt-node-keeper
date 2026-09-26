@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ChatGPT 节点守护程序 v3 —— 高频检测, 稳定优先, 全链路容错
+ChatGPT 节点守护程序 v4 —— 高频检测, 稳定优先, 全链路容错
 
 两级检测架构:
 [每分钟] 轻量体检: 不切换节点、零额外流量, 只验证当前节点对
@@ -10,8 +10,22 @@ ChatGPT 节点守护程序 v3 —— 高频检测, 稳定优先, 全链路容错
          超过 30 分钟时触发。逐个实测日/美节点的 ChatGPT 连通性
          + 带宽, 带迟滞切换(新节点没有快 25% 以上就不动)。
 
+v4 变更(相对 v3):
+- 修复: 带宽数据无效(0.0 MB/s, 测速双通道全失败)时不再触发切换;
+  区分三种情况 —— 当前可用且数据齐全 → 迟滞防抖; 当前可用但实测
+  偏慢(< 阈值) → 切换更快候选; 当前挂了 → 按(有效数据 > 带宽 >
+  延迟)降级选优, 并在日志中明确标注"降级选择"
+- 修复: 分组名缺失(KeyError)不再被误报为 "Vortex API 不可达",
+  体检结果区分 三态: True=健康 / False=节点异常 / None=守护链路异常
+- 修复: 当前节点未进延迟 Top-N 时强制纳入实测, 不再被盲目切走
+- 新增: macOS 通知中心告警(节点切换/全部候选不可用/API 异常),
+  同类通知 30 分钟节流防骚扰
+- 新增: 每次运行输出 status.json(当前节点/健康度/深度测试报告/
+  切换历史), 供 dashboard.py 仪表盘展示
+- 新增: 切换时若节点名地区与 ChatGPT 出口不符(中转落地)给出提示
+
 容错设计:
-- flock 进程锁, 高频运行不撞车
+- flock 进程锁, 高频运行不撞车(launchd 每分钟调度也安全)
 - 单节点测试失败不影响其他节点(逐节点 try/except)
 - 带宽测试双通道(Cloudflare 主 + CacheFly 备), 双失败时视为数据
   无效, 不做切换决策(避免垃圾数据引发误切)
@@ -19,6 +33,8 @@ ChatGPT 节点守护程序 v3 —— 高频检测, 稳定优先, 全链路容错
 手动运行: /usr/bin/python3 keeper.py          (自动判断轻重)
 强制深度: /usr/bin/python3 keeper.py --deep
 日志:     同目录 keeper.log (轻量体检正常时不写日志)
+状态:     同目录 status.json (仪表盘数据源, 每次运行原子刷新)
+常驻:     推荐 launchd(见同目录 *.plist), keeper-loop.sh 仅作手动兜底
 """
 import fcntl
 import json
@@ -41,11 +57,14 @@ HYSTERESIS = 1.25                  # 新节点要比当前快 25% 以上才切�
 SPEED_FLOOR = 0.3                 # 低于此 MB/s 视为无效带宽数据
 TRACE_TIMEOUT = 3.5               # 体检: 响应超过此秒数视为不健康
 DEEP_INTERVAL = 1800              # 例行深度测试间隔(秒)
+NOTIFY_THROTTLE = 1800            # 同类通知最小间隔(秒), 防骚扰
+HISTORY_MAX = 30                  # 仪表盘保留的切换历史条数
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(DIR, "keeper.log")
 LOCK = os.path.join(DIR, ".keeper.lock")
 STATE = os.path.join(DIR, ".keeper.state")
+STATUS = os.path.join(DIR, "status.json")
 
 SPEED_URLS = (
     "https://speed.cloudflare.com/__down?bytes=%d" % SPEED_BYTES,
@@ -63,6 +82,23 @@ def log(msg):
         pass
 
 
+def notify(kind, title, msg):
+    """macOS 通知中心提醒, 同类(kind)通知在 NOTIFY_THROTTLE 内只发一次"""
+    state = load_state()
+    now = time.time()
+    if now - state.get("notify_" + kind, 0) < NOTIFY_THROTTLE:
+        return
+    state["notify_" + kind] = now
+    save_state(state)
+    script = 'display notification "%s" with title "%s" sound name "Glass"' % (
+        msg.replace('"', "'"), title.replace('"', "'"))
+    try:
+        subprocess.run(["osascript", "-e", script], timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass  # 通知失败绝不影响主流程
+
+
 def api(path, method="GET", payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(BASE + path, method=method, data=data,
@@ -75,6 +111,8 @@ def api(path, method="GET", payload=None):
 
 def switch(node):
     """切换分组指向, 失败自动重试一次"""
+    if not node:
+        return False
     q = urllib.parse.quote(GROUP, safe="")
     for attempt in (1, 2):
         try:
@@ -85,6 +123,14 @@ def switch(node):
                 log("  ! 切换到 %s 失败: %s" % (node, e))
                 return False
             time.sleep(1)
+
+
+def get_current():
+    """读取分组当前实际指向的节点"""
+    try:
+        return api("/proxies")["proxies"][GROUP].get("now", "")
+    except Exception:
+        return None
 
 
 def delay_test(name):
@@ -116,18 +162,53 @@ def load_state():
 def save_state(d):
     try:
         with open(STATE, "w") as f:
-            json.dump(d, f)
+            json.dump(d, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def write_status(current, healthy, detail, state):
+    """每次运行后原子刷新 status.json, 供仪表盘读取"""
+    last_deep = state.get("last_deep", 0)
+    try:
+        last_deep_h = (datetime.fromtimestamp(last_deep)
+                       .strftime("%Y-%m-%d %H:%M:%S")) if last_deep else ""
+    except (ValueError, OSError):
+        last_deep_h = ""
+    status = {
+        "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_ts": time.time(),
+        "current": current,
+        "healthy": healthy,   # True/False/None(守护链路异常)
+        "detail": detail,
+        "last_deep": last_deep_h,
+        "history": state.get("history", []),
+        "last_report": state.get("last_report", {}),
+    }
+    try:
+        tmp = STATUS + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(status, f, ensure_ascii=False)
+        os.replace(tmp, STATUS)
     except OSError:
         pass
 
 
 # ---------------------------------------------------------------- 轻量体检
 def light_check():
-    """不切换任何节点, 只看当前节点对 ChatGPT 的健康度"""
+    """
+    返回 (当前节点, 健康度, 详情):
+      healthy=True  → 节点健康
+      healthy=False → 节点异常(挂了/变慢/非 200)
+      healthy=None  → 守护链路异常(API 不可达/分组缺失), 不是节点问题
+    """
     try:
-        current = api("/proxies")["proxies"][GROUP].get("now", "")
+        proxies = api("/proxies")["proxies"]
     except Exception as e:
-        return None, False, "Vortex API 不可达: %s" % e
+        return None, None, "Vortex API 不可达: %s" % e
+    if GROUP not in proxies:
+        return None, None, "代理列表中不存在分组「%s」(请检查订阅或分组名)" % GROUP
+    current = proxies[GROUP].get("now", "")
     out = curl(["-x", PROXY, "--max-time", "8", "-w",
                 "\nMETRICS:%{http_code}:%{time_total}",
                 "https://chatgpt.com/cdn-cgi/trace"], timeout=12)
@@ -174,13 +255,21 @@ def deep_test(reason):
         data = api("/proxies")["proxies"]
     except Exception as e:
         log("无法连接 Vortex API(%s), 放弃本轮" % e)
+        notify("api", "节点守护: Vortex API 不可达", "深度测试被迫放弃: %s" % e)
+        return
+    if GROUP not in data:
+        log("代理列表中不存在分组「%s」, 放弃本轮" % GROUP)
+        notify("group", "节点守护: 分组缺失",
+               "代理列表中不存在分组「%s」, 请检查订阅" % GROUP)
         return
     current = data[GROUP].get("now", "")
     groups = {n for n, p in data.items() if p["type"] in ("Selector", "URLTest", "Fallback")}
     nodes = [n for n in data[GROUP]["all"]
              if n not in groups and any(k in n for k in KEYWORDS)]
     if not nodes:
-        log("没有找到日/美节点, 请检查订阅")
+        log("没有找到日/美节点, 请更新订阅")
+        notify("nosub", "节点守护: 无可用日/美节点",
+               "订阅中没有日本/美国节点, 请更新订阅")
         return
 
     # 延迟初筛(不切换节点)
@@ -189,8 +278,13 @@ def deep_test(reason):
     ok = sorted((r for r in results if r[1] < 9999), key=lambda x: x[1])
     if not ok:
         log("所有 %d 个日/美节点都超时, 请更新订阅" % len(nodes))
+        notify("nosub", "节点守护: 日/美节点全部超时",
+               "全部 %d 个节点延迟测试超时, 请更新订阅" % len(nodes))
         return
     candidates = [n for n, _ in ok[:TOP_N]]
+    # 当前节点即使没进延迟 Top-N 也强制纳入实测, 避免因"没测到"被盲目切走
+    if current and current in nodes and current not in candidates:
+        candidates.append(current)
     log("候选 %d/%d, 逐一实测: %s" % (len(ok), len(nodes), " / ".join(candidates)))
 
     # 逐节点实测(单节点失败不影响其他)
@@ -209,32 +303,90 @@ def deep_test(reason):
             report[node] = (None, 0.0)
             log("  %s -> 测试异常: %s" % (node, e))
 
-    good = {n: v[1] for n, v in report.items() if v[0]}
+    delay_map = dict(ok)
+    delay_rank = {n: i for i, (n, _) in enumerate(ok)}
+
+    # 深度测试结果先落盘(无论后续是否切换, 供仪表盘展示)
+    st = load_state()
+    st["last_report"] = {n: {"loc": report[n][0],
+                             "speed": round(report[n][1], 2),
+                             "delay": delay_map.get(n)}
+                         for n in candidates if n in report}
+    st["last_deep_run"] = time.time()
+    save_state(st)
+
+    good = [n for n in candidates if report.get(n, (None, 0.0))[0]]
     if not good:
-        log("所有候选都无法访问 ChatGPT, 保持 %s" % current)
+        log("所有 %d 个候选都无法访问 ChatGPT, 保持 %s" % (len(candidates), current))
         switch(current)
+        notify("alldown", "节点守护: 候选节点全部不可用",
+               "深度测试: 所有候选都无法访问 ChatGPT, 保持当前节点")
         return
 
-    best = max(good, key=good.get)          # 并列时取延迟最低(插入序)
+    def rank_key(n):
+        """降级选优排序: 有效带宽数据 > 带宽高低 > 延迟高低"""
+        speed = report[n][1]
+        return (1 if speed >= SPEED_FLOOR else 0, speed, -delay_rank.get(n, 9999))
+
+    best = max(good, key=rank_key)
+    best_speed = report[best][1]
+    best_valid = best_speed >= SPEED_FLOOR
     cur_loc, cur_speed = report.get(current, (None, 0.0))
-    best_speed = good[best]
+    cur_valid = cur_loc is not None and cur_speed >= SPEED_FLOOR
 
-    # 决策: 数据无效不切; 数据有效时要求显著优势才切
-    data_valid = best_speed >= SPEED_FLOOR
-    new_better = data_valid and (cur_speed < SPEED_FLOOR
-                                 or best_speed >= cur_speed * HYSTERESIS)
-
-    if cur_loc and not new_better:
-        if not data_valid:
-            log("带宽数据无效(测速通道不可用), 保守保持 %s" % current)
-        else:
-            log("当前节点 %s 仍可用(%.1f MB/s), 最快候选优势不足 %.0f%%, 不切换"
-                % (current, cur_speed, (HYSTERESIS - 1) * 100))
+    if best == current:
+        log("当前节点 %s 已是候选中最优(%.1f MB/s), 不切换" % (current, best_speed))
         switch(current)
         return
 
-    switch(best)
-    log(">>> 已切换: %s -> %s(%.1f MB/s, 出口 %s)" % (current, best, best_speed, report[best][0]))
+    if cur_valid:
+        # 数据齐全: 要求新节点快 25% 以上才切(迟滞防抖)
+        if not (best_valid and best_speed >= cur_speed * HYSTERESIS):
+            log("当前节点 %s 仍可用(%.1f MB/s), 最快候选 %s(%.1f MB/s)优势不足 %.0f%%, 不切换"
+                % (current, cur_speed, best, best_speed, (HYSTERESIS - 1) * 100))
+            switch(current)
+            return
+    elif cur_loc and cur_speed > 0:
+        # 当前节点可用但实测带宽低于可用阈值(慢节点, 非测速失败):
+        # 候选有有效数据即切换, 无需迟滞
+        if not best_valid:
+            log("当前节点 %s 带宽仅 %.1f MB/s, 但候选均无有效带宽数据, 保守保持"
+                % (current, cur_speed))
+            switch(current)
+            return
+        log("当前节点 %s 带宽仅 %.1f MB/s(低于 %.1f 阈值), 切换到更快的 %s"
+            % (current, cur_speed, SPEED_FLOOR, best))
+    elif cur_loc:
+        # 当前节点可用但测速双通道全失败(0.0): 无效数据不做切换决策
+        log("当前节点 %s 可用但带宽数据无效(测速通道不可用), 保守保持不切换" % current)
+        switch(current)
+        return
+    else:
+        # 当前节点无法访问 ChatGPT: 降级选优(优先有效数据, 其次延迟最低)
+        log("当前节点 %s 无法访问 ChatGPT, 从 %d 个可用候选中选优"
+            % (current, len(good)))
+
+    if not switch(best):
+        switch(current)  # 切换失败至少恢复原状
+        return
+    log(">>> 已切换: %s -> %s(%.1f MB/s, 出口 %s)"
+        % (current, best, best_speed, report[best][0]))
+    if not best_valid:
+        log("  ! 新节点带宽数据无效(测速通道不可用), 本次为降级选择, 下轮体检会复核")
+    region = "日本" if "日本" in best else ("美国" if "美国" in best else None)
+    if region and report[best][0] not in ("JP", "US"):
+        log("  ! 注意: 节点名含「%s」但 ChatGPT 出口为 %s(中转落地), 地区与出口不符"
+            % (region, report[best][0]))
+    notify("switch", "节点守护: 已切换节点",
+           "%s → %s(%.1f MB/s, 出口 %s)" % (current, best, best_speed, report[best][0]))
+
+    st = load_state()
+    hist = st.setdefault("history", [])
+    hist.insert(0, {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "from": current, "to": best,
+                    "speed": round(best_speed, 1), "loc": report[best][0]})
+    del hist[HISTORY_MAX:]
+    save_state(st)
 
 
 # ---------------------------------------------------------------- 主流程
@@ -249,7 +401,7 @@ def main():
         return
 
     did_deep = False
-    current = None
+    current, healthy, detail = None, None, "未运行"
     try:
         state = load_state()
         current, healthy, detail = light_check()
@@ -259,7 +411,7 @@ def main():
             deep_test("手动强制")
         elif healthy:
             if time.time() - state.get("last_deep", 0) < DEEP_INTERVAL:
-                return  # 一切正常, 静默退出(不写日志, 不刷新计时器)
+                return  # 一切正常, 静默退出(不写日志)
             did_deep = True
             deep_test("例行巡检(距上次已超 %d 分钟)" % (DEEP_INTERVAL // 60))
         else:
@@ -268,11 +420,16 @@ def main():
     except Exception as e:
         log("主流程异常(已兜住): %s" % e)
     finally:
+        state = load_state()
         if did_deep:
-            state = load_state()
             state["last_deep"] = time.time()
-            state["last_node"] = current if current else None
-            save_state(state)
+            state["last_node"] = current or None
+            # 深度测试可能已切换节点, 重新读取实际指向, 保证 status.json 准确
+            fresh = get_current()
+            if fresh:
+                current = fresh
+        save_state(state)
+        write_status(current, healthy, detail, state)
 
 
 if __name__ == "__main__":
