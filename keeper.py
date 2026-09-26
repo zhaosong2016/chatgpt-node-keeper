@@ -23,6 +23,9 @@ v4 变更(相对 v3):
 - 新增: 每次运行输出 status.json(当前节点/健康度/深度测试报告/
   切换历史), 供 dashboard.py 仪表盘展示
 - 新增: 切换时若节点名地区与 ChatGPT 出口不符(中转落地)给出提示
+- 新增: 全量兜底扫描 —— 延迟 Top-N 候选全部无法访问 ChatGPT 时
+  (典型场景: OpenAI 按出口 IP 段封锁, 快节点整体沦陷), 自动扩大
+  范围实测剩余全部日/美节点, 慢节点往往在不同 IP 段仍可用
 
 容错设计:
 - flock 进程锁, 高频运行不撞车(launchd 每分钟调度也安全)
@@ -289,11 +292,12 @@ def deep_test(reason):
 
     # 逐节点实测(单节点失败不影响其他)
     report = {}
-    for node in candidates:
+
+    def measure(node):
         try:
             if not switch(node):
                 report[node] = (None, 0.0)
-                continue
+                return
             time.sleep(0.5)
             loc = chatgpt_loc()
             mbps = speed_test() if loc else 0.0
@@ -303,6 +307,19 @@ def deep_test(reason):
             report[node] = (None, 0.0)
             log("  %s -> 测试异常: %s" % (node, e))
 
+    for node in candidates:
+        measure(node)
+
+    # 兜底: Top-N 候选全部无法访问 ChatGPT 时, 扩大到剩余全部日/美节点。
+    # 场景: OpenAI 按 IP 段封锁时, 快节点常整体沦陷, 慢节点反而可用。
+    if not any(report.get(n, (None, 0.0))[0] for n in candidates):
+        rest = [n for n in nodes if n not in report]
+        if rest:
+            log("候选全部失败, 扩大范围实测剩余 %d 个节点: %s"
+                % (len(rest), " / ".join(rest)))
+            for node in rest:
+                measure(node)
+
     delay_map = dict(ok)
     delay_rank = {n: i for i, (n, _) in enumerate(ok)}
 
@@ -311,13 +328,14 @@ def deep_test(reason):
     st["last_report"] = {n: {"loc": report[n][0],
                              "speed": round(report[n][1], 2),
                              "delay": delay_map.get(n)}
-                         for n in candidates if n in report}
+                         for n in report}
     st["last_deep_run"] = time.time()
     save_state(st)
 
-    good = [n for n in candidates if report.get(n, (None, 0.0))[0]]
+    good = [n for n in report if report[n][0]]
     if not good:
-        log("所有 %d 个候选都无法访问 ChatGPT, 保持 %s" % (len(candidates), current))
+        log("全部 %d 个日/美节点都无法访问 ChatGPT(疑似出口 IP 段被 OpenAI 封锁), 保持 %s"
+            % (len(report), current))
         switch(current)
         notify("alldown", "节点守护: 候选节点全部不可用",
                "深度测试: 所有候选都无法访问 ChatGPT, 保持当前节点")
